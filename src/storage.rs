@@ -10,6 +10,7 @@ use std::os::unix::io::AsFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
+use std::os::unix::prelude::BorrowedFd;
 
 const MAX_FILE_SIZE: u64 = 1024 * 1024 * 100; // 1 GB
 const INDEX_ENTRY_SIZE: usize = 16;
@@ -319,23 +320,7 @@ impl DataStorage {
             if let Some(data_file_locked) = &self.data_file {
                 let data_file = data_file_locked.read().await;
                 let in_fd = data_file.as_fd();
-                let mut _size = size;
-                let mut _start = start as i64;
-                loop {
-                    match sendfile(sock_fd.clone(), in_fd, Some(&mut _start), _size) {
-                        Ok(sent_count) => {
-                            if sent_count == 0 {
-                                break;
-                            }
-                            _size = _size - sent_count
-                        }
-                        Err(e) => {
-                            if e == Errno::EAGAIN {
-                                continue;
-                            }
-                        }
-                    };
-                }
+                let _size = call_sendfile(sock_fd,in_fd, start, size);
                 Ok(size - _size)
             } else {
                 return Err(io::Error::new(
@@ -377,23 +362,7 @@ impl DataStorage {
                     (len - start) as usize
                 };
                 let in_fd = entry.data_file.as_fd();
-                let mut _size = size;
-                let mut _start = start as i64;
-                loop {
-                    match sendfile(sock_fd.clone(), in_fd, Some(&mut _start), _size) {
-                        Ok(sent_count) => {
-                            if sent_count == 0 {
-                                break;
-                            }
-                            _size = _size - sent_count
-                        }
-                        Err(e) => {
-                            if e == Errno::EAGAIN {
-                                continue;
-                            }
-                        }
-                    };
-                }
+                let _size = call_sendfile(sock_fd,in_fd, start, size);
                 Ok(size - _size)
             } else {
                 return Err(io::Error::new(
@@ -403,4 +372,25 @@ impl DataStorage {
             }
         }
     }
+}
+
+fn call_sendfile<S>(sock_fd: S, in_fd: BorrowedFd<'_>, start: u64, size: usize) -> usize where S: AsFd + Clone {
+    let mut _size = size;
+    let mut _start = start as i64;
+    loop {
+        match sendfile(sock_fd.clone(), in_fd, Some(&mut _start), _size) {
+            Ok(sent_count) => {
+                if sent_count == 0 {
+                    break;
+                }
+                _size = _size - sent_count
+            }
+            Err(e) => {
+                if e == Errno::EAGAIN {
+                    continue;
+                }
+            }
+        };
+    }
+    _size
 }
