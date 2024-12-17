@@ -1,0 +1,14 @@
+[package]
+name = "SonicrabMQ"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "*", features = ["full"] }
+serde = { version = "*", features = ["derive"] }
+memmap2 = "0.9.5" 
+nix = {version = "*",features = ["zerocopy"]}
+byteorder  = "*"
+bincode = "*"
+chrono = "*"
+lru = "*"

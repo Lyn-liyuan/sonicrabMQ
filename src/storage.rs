@@ -21,21 +21,21 @@ const PULL_MAX_LIMIT: usize = 1024 * 1024 * 100; // Example threshold for pull l
 type Offset = AtomicU64;
 
 struct FileEntry {
-    base_offset: u64,
-    data_file: File,
-    data: MmapMut,
+    base_offset: u64, //历史索引文件的基础偏移
+    data_file: File, // 数据文件
+    data: MmapMut, // 索引内存映射
 }
 
 pub struct DataStorage {
     data_dir: PathBuf,
-    base_offset: Offset,
-    position_offset: Offset,
-    index_len: Offset,
-    data_len: Offset,
-    data_file: Option<RwLock<File>>,
-    index_file: Option<RwLock<File>>,
-    index_map: Option<RwLock<MmapMut>>,
-    files: RwLock<Vec<FileEntry>>,
+    base_offset: Offset, // 当前索引文件的基础偏移
+    position_offset: Offset, // 当前索引文件的偏移位置
+    index_len: Offset, //索引文件长度
+    data_len: Offset, //数据文件长度
+    data_file: Option<RwLock<File>>, //当前数据文件
+    index_file: Option<RwLock<File>>, //当前索引文件
+    index_map: Option<RwLock<MmapMut>>, //当前索引文件的内存映射
+    files: RwLock<Vec<FileEntry>>, //历史文件项
 }
 
 impl DataStorage {
@@ -105,13 +105,14 @@ impl DataStorage {
             ))
         }
     }
-
+    // 从目录中恢复 DataStorage 的相关字段 
     async fn initialize_files(&mut self) -> io::Result<()> {
         let mut offsets = vec![];
 
         for entry in std::fs::read_dir(&self.data_dir)? {
             let entry = entry?;
             let path = entry.path();
+            // 目录中读取文件名作为历史文件的 base_offset
             if path.extension().and_then(|s| s.to_str()) == Some("data") {
                 if let Some(offset) = path
                     .file_stem()
@@ -122,19 +123,24 @@ impl DataStorage {
                 }
             }
         }
-
+        // 判断目录是否为空
         if offsets.is_empty() {
+            // 数据目录为空，创建新的数据和索引文件
             self.create_new_files(0).await?;
         } else {
+            // 排序文件名
             offsets.sort();
             if let Some(&last_offset) = offsets.last() {
+                // 设置当前基础偏移为最新文件的基础偏移
                 self.base_offset.store(last_offset, Ordering::SeqCst);
                 for file_name in offsets {
                     if file_name == last_offset {
+                        // 当前文件后续进行操作
                         continue;
                     } else {
-                        let data_file = self.open_data_file(file_name).await?;
-                        let (_, map) = self.open_index_file(file_name).await?;
+                        // 历史文件打开并装载到历史文件列表中
+                        let data_file = self.open_data_file(file_name,true).await?;
+                        let (_, map) = self.open_index_file(file_name,true).await?;
                         self.files.write().await.push(FileEntry {
                             base_offset: file_name,
                             data_file: data_file,
@@ -142,10 +148,12 @@ impl DataStorage {
                         });
                     }
                 }
+                // 创建当前文件
                 self.create_new_files(last_offset).await?;
 
                 let index_len = self.get_index_len().await?;
                 self.index_len.swap(index_len, Ordering::SeqCst);
+                // 从索引文件读取当前偏移位置 position_offset
                 for index in (0..index_len).step_by(INDEX_ENTRY_SIZE) {
                     let start = self.read_index(index as usize).await?;
                     let end = self
@@ -172,8 +180,11 @@ impl DataStorage {
     }
 
     async fn create_new_files(&mut self, offset: u64) -> io::Result<()> {
-        let data_file = self.open_data_file(offset).await?;
+        // 创建数据文件
+        let data_file = self.open_data_file(offset,false).await?;
+        // 采用 offset 作为文件名创建索引文件
         let (index_file, map) = self.create_index_file(offset).await?;
+        // 设置 storage 各个字段
         let data_len = data_file.metadata()?.len();
         self.data_len.swap(data_len, Ordering::SeqCst);
         let index_len = index_file.metadata()?.len();
@@ -182,33 +193,24 @@ impl DataStorage {
         self.data_file = Some(RwLock::new(data_file));
         self.index_file = Some(RwLock::new(index_file));
         self.index_map = Some(RwLock::new(map));
-
-        let base_offset = self.base_offset.swap(offset, Ordering::SeqCst);
-        let data_file = self.open_data_file(base_offset).await?;
-        let (_, map) = self.open_index_file(base_offset).await?;
-        self.files.write().await.push(FileEntry {
-            base_offset: base_offset,
-            data_file: data_file,
-            data: map,
-        });
         Ok(())
     }
 
-    async fn open_data_file(&self, offset: u64) -> io::Result<File> {
+    async fn open_data_file(&self, offset: u64, readonly: bool) -> io::Result<File> {
         let path = self.data_dir.join(format!("{:012}.data", offset));
         let file = OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(!readonly)
             .create(true)
             .open(path)?;
         Ok(file)
     }
 
-    async fn open_index_file(&self, offset: u64) -> io::Result<(File, MmapMut)> {
+    async fn open_index_file(&self, offset: u64, readonly: bool) -> io::Result<(File, MmapMut)> {
         let path = self.data_dir.join(format!("{:012}.index", offset));
         let file = OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(!readonly)
             .create(false) // Do not create a new file; only open an existing one
             .open(&path)?;
 
@@ -242,16 +244,29 @@ impl DataStorage {
             ))
         }
     }
-
+    // 将消息写入文件中并建立索引
     pub async fn append_data(&mut self, data: &[u8]) -> io::Result<()> {
+        // 超过阈值创立新文件
         if self.data_len.load(Ordering::SeqCst) + data.len() as u64 > MAX_FILE_SIZE {
             let position = self.position_offset.load(Ordering::SeqCst);
             self.create_new_files(position).await?;
+            // 因为创建了新文件，把当前文件重新只读打开放入历史文件列表
+            let base_offset = self.base_offset.swap(position, Ordering::SeqCst);
+            let data_file = self.open_data_file(base_offset,true).await?;
+            let (_, map) = self.open_index_file(base_offset,true).await?;
+            self.files.write().await.push(FileEntry {
+                base_offset: base_offset,
+                data_file: data_file,
+                data: map,
+            });
+            
         }
+        
         let base_offset = self.base_offset.load(Ordering::SeqCst);
         let position = self.position_offset.load(Ordering::SeqCst);
         let new_size = (position + 2 - base_offset) * (INDEX_ENTRY_SIZE as u64);
         let old_size = self.get_index_len().await?;
+        // 新增的索引项超过索引文件的长度，需要扩展索引文件
         if new_size > old_size {
             self.expand_index_file(old_size + INDEX_EXPANSION_SIZE as u64)
                 .await?;
@@ -266,18 +281,21 @@ impl DataStorage {
             let data_len = data.len() as u32;
             header[0..4].copy_from_slice(&data_len.to_be_bytes());
             header[4..12].copy_from_slice(&position.to_be_bytes());
+            // 写入记录头和数据
             data_file.write_all(&header)?;
             data_file.write_all(data)?;
             let end = start + header.len() as u64 + data.len() as u64;
             self.data_len
                 .fetch_add(header.len() as u64 + data.len() as u64, Ordering::SeqCst);
             if let Some(index_map_lock) = &self.index_map {
+                // 将记录位置写入索引
                 let mut index_map = index_map_lock.write().await;
                 let entry_start = (position - base_offset) as usize * INDEX_ENTRY_SIZE;
                 (&mut index_map[entry_start..entry_start + 8usize])
                     .copy_from_slice(&start.to_be_bytes());
                 (&mut index_map[entry_start + 8usize..entry_start + 16usize])
                     .copy_from_slice(&end.to_be_bytes());
+                // 在最新索引项后面加入0，以便重启的时候设置position_offset
                 (&mut index_map[entry_start + 16usize..entry_start + 24usize])
                     .copy_from_slice(&0u64.to_be_bytes());
                 (&mut index_map[entry_start + 24usize..entry_start + 32usize])
@@ -297,7 +315,8 @@ impl DataStorage {
             ))
         }
     }
-
+    
+    // 在当前或者历史文件定位数据并通过sendfile发送
     pub async fn sendfile<S>(&self, offset: u64, sock_fd: S) -> io::Result<usize>
     where
         S: AsFd + Clone,
@@ -305,12 +324,13 @@ impl DataStorage {
         // Find the correct index file by range
         let base_offset = self.base_offset.load(Ordering::SeqCst);
         let position = self.position_offset.load(Ordering::SeqCst);
-
+        // 在当前文件中
         if offset >= base_offset && position > offset {
             let index_position = (offset - base_offset) as usize * INDEX_ENTRY_SIZE;
             let start = self.read_index(index_position).await?;
             let end = self.read_index(index_position + INDEX_ENTRY_SIZE).await?;
             let len = self.data_len.load(Ordering::SeqCst);
+            // 不大于阈值的情况下，尽量多的返回记录
             let size = if len - start > PULL_MAX_LIMIT as u64 {
                 (end - start) as usize
             } else {
@@ -320,6 +340,7 @@ impl DataStorage {
             if let Some(data_file_locked) = &self.data_file {
                 let data_file = data_file_locked.read().await;
                 let in_fd = data_file.as_fd();
+                // 发送当前文件的数据
                 let _size = call_sendfile(sock_fd,in_fd, start, size);
                 Ok(size - _size)
             } else {
@@ -332,13 +353,13 @@ impl DataStorage {
             let mut selected_file = None;
             let guard = self.files.read().await;
             let len = guard.len();
+            // 在历史文件中定位索引项
             if len > 0 {
                 let mut pre = 0;
                 for i in 0..len {
                     let base = guard[i].base_offset;
                     if offset < base {
                         selected_file = Some(&guard[pre]);
-
                         break;
                     }
                     pre = i
@@ -349,6 +370,7 @@ impl DataStorage {
                     }
                 }
             }
+            // 找到匹配的索引文件获取索引项并根据索引项发送数据
             if let Some(entry) = selected_file {
                 let index_position = (offset - entry.base_offset) as usize * INDEX_ENTRY_SIZE;
                 let start =
@@ -373,7 +395,7 @@ impl DataStorage {
         }
     }
 }
-
+// 调用 linux 函数 sendfile 零拷贝发送数据
 fn call_sendfile<S>(sock_fd: S, in_fd: BorrowedFd<'_>, start: u64, size: usize) -> usize where S: AsFd + Clone {
     let mut _size = size;
     let mut _start = start as i64;
