@@ -1,0 +1,9 @@
+[server]
+address = "0.0.0.0"
+port = 8080
+path = "messages"
+
+[storage]
+max_file_size = "100m"
+pull_max_limit = "100m"
+cache_limit = 10

@@ -11,12 +11,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use std::os::unix::prelude::BorrowedFd;
+use crate::config::{Storage,parse_size};
 
-const MAX_FILE_SIZE: u64 = 1024 * 1024 * 100; // 1 GB
+
 const INDEX_ENTRY_SIZE: usize = 16;
 const INITIAL_INDEX_SIZE: usize = 1024 * INDEX_ENTRY_SIZE; // Initial index file size
 const INDEX_EXPANSION_SIZE: usize = 512 * INDEX_ENTRY_SIZE; // Index expansion size
-const PULL_MAX_LIMIT: usize = 1024 * 1024 * 100; // Example threshold for pull limit
+
 
 type Offset = AtomicU64;
 
@@ -36,10 +37,14 @@ pub struct DataStorage {
     index_file: Option<RwLock<File>>, //当前索引文件
     index_map: Option<RwLock<MmapMut>>, //当前索引文件的内存映射
     files: RwLock<Vec<FileEntry>>, //历史文件项
+    max_file_size: usize,
+    pull_max_limit: usize,
+    cache_limit: usize,
 }
 
 impl DataStorage {
-    pub async fn new(data_dir: PathBuf) -> io::Result<Self> {
+    pub async fn new(data_dir: PathBuf,config:&Storage) -> io::Result<Self> {
+        
         let mut storage = Self {
             data_dir,
             base_offset: AtomicU64::new(0),
@@ -50,6 +55,9 @@ impl DataStorage {
             index_file: None,
             index_map: None,
             files: Vec::new().into(),
+            max_file_size: parse_size(config.max_file_size.as_str()).unwrap_or_else(|_|1024 * 1024 * 100 as usize),
+            pull_max_limit: parse_size(config.pull_max_limit.as_str()).unwrap_or_else(|_|1024 * 1024 * 50 as usize),
+            cache_limit: config.cache_limit,
         };
         storage.initialize_files().await?;
         Ok(storage)
@@ -139,9 +147,13 @@ impl DataStorage {
                         continue;
                     } else {
                         // 历史文件打开并装载到历史文件列表中
+                        let mut files = self.files.write().await;
+                        if files.len() + 1 > self.cache_limit {
+                            break;
+                        }
                         let data_file = self.open_data_file(file_name,true).await?;
-                        let (_, map) = self.open_index_file(file_name,true).await?;
-                        self.files.write().await.push(FileEntry {
+                        let (_, map) = self.open_index_file(file_name).await?;
+                        files.push(FileEntry {
                             base_offset: file_name,
                             data_file: data_file,
                             data: map,
@@ -198,20 +210,24 @@ impl DataStorage {
 
     async fn open_data_file(&self, offset: u64, readonly: bool) -> io::Result<File> {
         let path = self.data_dir.join(format!("{:012}.data", offset));
-        let file = OpenOptions::new()
+        let file = if readonly { OpenOptions::new()
+            .read(true).open(&path)?
+        } else {
+            OpenOptions::new()
             .read(true)
-            .write(!readonly)
-            .create(true)
-            .open(path)?;
+            .write(true)
+            .create(true) // Do not create a new file; only open an existing one
+            .open(&path)?
+        };
         Ok(file)
     }
 
-    async fn open_index_file(&self, offset: u64, readonly: bool) -> io::Result<(File, MmapMut)> {
+    async fn open_index_file(&self, offset: u64) -> io::Result<(File, MmapMut)> {
         let path = self.data_dir.join(format!("{:012}.index", offset));
         let file = OpenOptions::new()
             .read(true)
-            .write(!readonly)
-            .create(false) // Do not create a new file; only open an existing one
+            .write(true)
+            .create(true) // Do not create a new file; only open an existing one
             .open(&path)?;
 
         let mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -247,14 +263,18 @@ impl DataStorage {
     // 将消息写入文件中并建立索引
     pub async fn append_data(&mut self, data: &[u8]) -> io::Result<()> {
         // 超过阈值创立新文件
-        if self.data_len.load(Ordering::SeqCst) + data.len() as u64 > MAX_FILE_SIZE {
+        if self.data_len.load(Ordering::SeqCst) + data.len() as u64 > self.max_file_size as u64 {
             let position = self.position_offset.load(Ordering::SeqCst);
             self.create_new_files(position).await?;
             // 因为创建了新文件，把当前文件重新只读打开放入历史文件列表
+            let mut files = self.files.write().await;
+            if files.len() + 1 > self.cache_limit {
+                files.remove(0);
+            }
             let base_offset = self.base_offset.swap(position, Ordering::SeqCst);
             let data_file = self.open_data_file(base_offset,true).await?;
-            let (_, map) = self.open_index_file(base_offset,true).await?;
-            self.files.write().await.push(FileEntry {
+            let (_, map) = self.open_index_file(base_offset).await?;
+            files.push(FileEntry {
                 base_offset: base_offset,
                 data_file: data_file,
                 data: map,
@@ -331,7 +351,7 @@ impl DataStorage {
             let end = self.read_index(index_position + INDEX_ENTRY_SIZE).await?;
             let len = self.data_len.load(Ordering::SeqCst);
             // 不大于阈值的情况下，尽量多的返回记录
-            let size = if len - start > PULL_MAX_LIMIT as u64 {
+            let size = if len - start > self.pull_max_limit as u64 {
                 (end - start) as usize
             } else {
                 (len - start) as usize
@@ -378,7 +398,7 @@ impl DataStorage {
                 let end = (&entry.data[index_position + 8..index_position + 16])
                     .read_u64::<BigEndian>()?;
                 let len = entry.data_file.metadata()?.len();
-                let size = if len - start > PULL_MAX_LIMIT as u64 {
+                let size = if len - start > self.pull_max_limit as u64 {
                     (end - start) as usize
                 } else {
                     (len - start) as usize

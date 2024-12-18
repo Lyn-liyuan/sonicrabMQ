@@ -11,4 +11,6 @@ nix = {version = "*",features = ["zerocopy"]}
 byteorder  = "*"
 bincode = "*"
 chrono = "*"
-lru = "*"
+dashmap = "6.1.0"
+toml = "0.5"
+regex = "*"

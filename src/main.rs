@@ -1,12 +1,11 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-
-
+use dashmap::DashMap;
+use std::fs;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
 use std::path::PathBuf;
 use std::io::Cursor;
 use std::io::{self,Read, Write};
-
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,9 +13,11 @@ use tokio::sync::RwLock;
 use std::os::unix::io::AsFd;
 mod storage;
 use crate::storage::DataStorage;
+mod config;
+use crate::config::Config;
 
 
-const MESSAGES_PATH: &str = "messages";
+
 
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -31,13 +32,13 @@ struct Broker {
 
 impl Broker {
     
-    async fn new(name: String) -> Self {
-        let broker_path = MESSAGES_PATH.to_string() + "/" + name.as_str();
+    async fn new(name: String,config:&Config) -> Self {
+        let broker_path = config.server.path.clone() + "/" + name.as_str();
         if create_directory_if_not_exists(broker_path.as_str()).is_err() {
             println!("crate breaker {} path failed!", name)
         }
         let file_dir = PathBuf::from(broker_path);
-        let manager = DataStorage::new(file_dir).await.unwrap();
+        let manager = DataStorage::new(file_dir,&config.storage).await.unwrap();
         
         Broker {
            store: manager,
@@ -61,7 +62,8 @@ impl Broker {
 
 async fn handle_client(
     mut stream: TcpStream,
-    brokers: Arc<RwLock<HashMap<String, Arc<RwLock<Broker>>>>>,
+    brokers: Arc<DashMap<String, Arc<RwLock<Broker>>>>,
+    config:Config
 ) -> io::Result<()>{
     loop {
         let mut len_buf = [0; 4];
@@ -94,7 +96,7 @@ async fn handle_client(
             let broker_name = String::from_utf8(broker_buf).unwrap();
             let position = cursor.position() as usize;
             let payload = cursor.into_inner()[position..].to_vec();
-            let broker = get_broker(&brokers, broker_name).await;
+            let broker = get_broker(&brokers, broker_name,&config).await;
 
             broker.write().await.receive_message(payload).await?;
             let mut response = Vec::new();
@@ -109,7 +111,7 @@ async fn handle_client(
             
             let offset = ReadBytesExt::read_u64::<BigEndian>(&mut cursor).unwrap();
 
-            let broker = get_broker(&brokers, broker_name).await;
+            let broker = get_broker(&brokers, broker_name,&config).await;
             broker
                 .write()
                 .await
@@ -120,16 +122,16 @@ async fn handle_client(
     Ok(())
 }
 
-async fn get_broker(brokers: &Arc<RwLock<HashMap<String, Arc<RwLock<Broker>>>>>, broker_name: String) -> Arc<RwLock<Broker>> {
-        let mut brokers = brokers.write().await;
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            brokers.entry(broker_name.clone())
-        {
-            let new_broker = Broker::new(broker_name.clone()).await;
-            entry.insert(Arc::new(RwLock::new(new_broker))).clone()
-        } else {
+async fn get_broker(brokers: &Arc<DashMap<String, Arc<RwLock<Broker>>>>, broker_name: String, config:&Config) -> Arc<RwLock<Broker>> {
+        
+        if brokers.contains_key(&broker_name) {
             brokers.get(&broker_name).unwrap().clone()
+        } else {
+            let new_broker = Arc::new(RwLock::new(Broker::new(broker_name.clone(),config).await));
+            brokers.insert(broker_name, new_broker.clone());
+            new_broker
         }
+        
 }
 
 fn create_directory_if_not_exists(path: &str) -> std::io::Result<()> {
@@ -144,18 +146,23 @@ fn create_directory_if_not_exists(path: &str) -> std::io::Result<()> {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    create_directory_if_not_exists(MESSAGES_PATH)?;
-    let brokers = Arc::new(RwLock::new(HashMap::new()));
+    let config_content = fs::read_to_string("config.toml")?;
+    
+    let config: Config = toml::from_str(&config_content)?;
 
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
+    create_directory_if_not_exists(&config.server.path)?;
+    let brokers = Arc::new(DashMap::new());
+    let address = format!("{}:{}",config.server.address,config.server.port);
+    let listener = TcpListener::bind(address).await?;
 
     println!("Broker server is running on 0.0.0.0:8080");
 
     loop {
         let (stream, _) = listener.accept().await?;
         let brokers = brokers.clone();
+        let config = config.clone();
         tokio::spawn(async move {
-            handle_client(stream, brokers).await.unwrap();
+            handle_client(stream, brokers,config).await.unwrap();
         });
     }
 }

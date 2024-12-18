@@ -62,7 +62,7 @@ def fetch_messages(broker_name, offset):
 
 if __name__ == "__main__":
     broker_name = "test_broker"
-    offset = 187
+    offset = 0
     try:
         while True:
             result = fetch_messages(broker_name, offset)
