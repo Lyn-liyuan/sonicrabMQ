@@ -76,6 +76,19 @@ async fn handle_client(
         }
 
         let mut cursor = Cursor::new(buffer);
+        let key_len = ReadBytesExt::read_u16::<BigEndian>(&mut cursor).unwrap() as usize;
+        let mut key_buf = vec![0; key_len];
+        std::io::Read::read_exact(&mut cursor, &mut key_buf).unwrap();
+        let key = String::from_utf8(key_buf).unwrap();
+        if key != config.server.authorization {
+            let mut response = Vec::new();
+            let content = b"Server authentication failed.";
+            WriteBytesExt::write_u32::<BigEndian>(&mut response, content.len() as u32).unwrap();
+            Write::write_all(&mut response, content).unwrap();
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &response).await;
+            return Ok(())
+        }
+
         let command_len = ReadBytesExt::read_u16::<BigEndian>(&mut cursor).unwrap() as usize;
         let mut command_buf = vec![0; command_len];
         std::io::Read::read_exact(&mut cursor, &mut command_buf).unwrap();
@@ -88,13 +101,20 @@ async fn handle_client(
             let broker_name = String::from_utf8(broker_buf).unwrap();
             let position = cursor.position() as usize;
             let payload = cursor.into_inner()[position..].to_vec();
-            let broker = get_broker(&brokers, broker_name,&config).await;
-
-            broker.write().await.receive_message(payload).await?;
-            let mut response = Vec::new();
-            WriteBytesExt::write_u32::<BigEndian>(&mut response, 2).unwrap();
-            Write::write_all(&mut response, b"OK").unwrap();
-            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &response).await;
+           
+            if let Some(broker) = get_broker(&brokers, broker_name,&config).await{
+                broker.write().await.receive_message(payload).await?;
+                let mut response = Vec::new();
+                WriteBytesExt::write_u32::<BigEndian>(&mut response, 2).unwrap();
+                Write::write_all(&mut response, b"OK").unwrap();
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &response).await;
+            } else {
+                let mut response = Vec::new();
+                let content = b"NO_BROKER";
+                WriteBytesExt::write_u32::<BigEndian>(&mut response, content.len() as u32).unwrap();
+                Write::write_all(&mut response, content).unwrap();
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &response).await;
+            }
         } else if command == "PULL" {
             let broker_len = ReadBytesExt::read_u16::<BigEndian>(&mut cursor).unwrap() as usize;
             let mut broker_buf = vec![0; broker_len];
@@ -103,25 +123,36 @@ async fn handle_client(
             
             let offset = ReadBytesExt::read_u64::<BigEndian>(&mut cursor).unwrap();
 
-            let broker = get_broker(&brokers, broker_name,&config).await;
-            broker
-                .write()
-                .await
-                .send_messages_since(offset as usize, &mut stream)
-                .await?;
+            if let Some(broker) = get_broker(&brokers, broker_name,&config).await{
+                broker
+                    .write()
+                    .await
+                    .send_messages_since(offset as usize, &mut stream)
+                    .await?;
+            } else {
+                let mut response = Vec::new();
+                let content = b"NO_BROKER";
+                WriteBytesExt::write_u32::<BigEndian>(&mut response, content.len() as u32).unwrap();
+                Write::write_all(&mut response, content).unwrap();
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &response).await;
+            }
         }
     }
     Ok(())
 }
 
-async fn get_broker(brokers: &Arc<DashMap<String, Arc<RwLock<Broker>>>>, broker_name: String, config:&Config) -> Arc<RwLock<Broker>> {
+async fn get_broker(brokers: &Arc<DashMap<String, Arc<RwLock<Broker>>>>, broker_name: String, config:&Config) -> Option<Arc<RwLock<Broker>>> {
         
         if brokers.contains_key(&broker_name) {
-            brokers.get(&broker_name).unwrap().clone()
+            Some(brokers.get(&broker_name).unwrap().clone())
         } else {
-            let new_broker = Arc::new(RwLock::new(Broker::new(broker_name.clone(),config).await));
-            brokers.insert(broker_name, new_broker.clone());
-            new_broker
+            if (brokers.len() + 1) as u16 <= config.server.broker_limit {
+                let new_broker = Arc::new(RwLock::new(Broker::new(broker_name.clone(),config).await));
+                brokers.insert(broker_name, new_broker.clone());
+                Some(new_broker)
+            } else {
+                None
+            }
         }
         
 }
@@ -144,8 +175,21 @@ async fn main() -> std::io::Result<()> {
 
     create_directory_if_not_exists(&config.server.path)?;
     let brokers = Arc::new(DashMap::new());
+    
+    for broker_folder in std::fs::read_dir(PathBuf::from(&config.server.path))? {
+        let folder = broker_folder?;
+        let file_type = folder.file_type()?;
+        if file_type.is_dir() {
+            let file_name = folder.file_name().to_string_lossy().to_string();
+            let new_broker = Arc::new(RwLock::new(Broker::new(file_name.clone(),&config).await));
+            brokers.insert(file_name, new_broker.clone());
+        }
+    }
+    
+    
     let address = format!("{}:{}",config.server.address,config.server.port);
     let listener = TcpListener::bind(address).await?;
+
 
     println!("Broker server is running on 0.0.0.0:8080");
 

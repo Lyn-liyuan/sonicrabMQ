@@ -2,6 +2,8 @@
 address = "0.0.0.0"
 port = 8080
 path = "messages"
+broker_limit = 10
+authorization = "a8eecf33-c18c-4d78-bf22-3770406e7768"
 
 [storage]
 max_file_size = "100m"

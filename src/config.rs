@@ -6,6 +6,8 @@ pub struct Server {
     pub address: String,
     pub port: u16,
     pub path: String,
+    pub broker_limit: u16,
+    pub authorization: String
 }
 
 #[derive(Debug, Deserialize,Clone)]

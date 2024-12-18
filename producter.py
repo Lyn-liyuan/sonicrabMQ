@@ -7,12 +7,14 @@ import string
 def send_push_message(broker_name, payload):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect(('127.0.0.1', 8080))
-        
+        key = "a8eecf33-c18c-4d78-bf22-3770406e7768x".encode('utf-8')
         command = "PUSH".encode('utf-8')
         broker_name_bytes = broker_name.encode('utf-8')
         
         message = struct.pack(
-            ">H{}sH{}s".format(len(command), len(broker_name_bytes)),
+            ">H{}sH{}sH{}s".format(len(key),len(command), len(broker_name_bytes)),
+            len(key),
+            key,
             len(command),
             command,
             len(broker_name_bytes),
@@ -25,7 +27,7 @@ def send_push_message(broker_name, payload):
         
         response_length = struct.unpack(">I", s.recv(4))[0]
         response = s.recv(response_length)
-        #print("Server response:", response.decode('utf-8'))
+        print("Server response:", response.decode('utf-8'))
 
 
 def generate_random_string(size):
@@ -34,7 +36,7 @@ def generate_random_string(size):
 
 
 if __name__ == "__main__":
-    broker_name = "test_broker"
+    broker_name = "test2_broker"
     for i in range(450):
         payload_size = random.randint(512, 1024 * 1024)  # 在512字节到1M字节之间随机生成负载大小
         payload = generate_random_string(payload_size)  # 生成指定大小的随机负载数据
