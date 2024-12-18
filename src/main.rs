@@ -1,7 +1,7 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use dashmap::DashMap;
 use std::fs;
-use serde::{Deserialize, Serialize};
+
 
 use std::path::PathBuf;
 use std::io::Cursor;
@@ -17,14 +17,6 @@ mod config;
 use crate::config::Config;
 
 
-
-
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Message {
-    id: usize,
-    payload: Vec<u8>,
-}
 
 struct Broker {
     store:DataStorage
@@ -165,4 +157,5 @@ async fn main() -> std::io::Result<()> {
             handle_client(stream, brokers,config).await.unwrap();
         });
     }
+    
 }
