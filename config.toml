@@ -7,5 +7,5 @@ authorization = "a8eecf33-c18c-4d78-bf22-3770406e7768"
 
 [storage]
 max_file_size = "100m"
-pull_max_limit = "100m"
+pull_max_limit = "10m"
 cache_limit = 10

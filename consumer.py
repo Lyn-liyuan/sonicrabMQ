@@ -60,6 +60,7 @@ def fetch_messages(broker_name, offset, stats_queue, total_bytes_received):
                         if response_length == 0:
                             if new_offset_bytes != None:
                                offset = offset + 1
+                            
                             break  # No more messages in this batch
                         
                         

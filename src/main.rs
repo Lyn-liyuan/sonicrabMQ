@@ -1,8 +1,6 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use dashmap::DashMap;
 use std::fs;
-
-
 use std::path::PathBuf;
 use std::io::Cursor;
 use std::io::{self,Read, Write};
@@ -10,13 +8,14 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tokio::time::{self, Duration};
 use std::os::unix::io::AsFd;
 mod storage;
 use crate::storage::DataStorage;
 mod config;
 use crate::config::Config;
-
-
+mod fileclear;
+use fileclear::delete_old_files;
 
 struct Broker {
     store:DataStorage
@@ -192,7 +191,22 @@ async fn main() -> std::io::Result<()> {
     
     let address = format!("{}:{}",config.server.address,config.server.port);
     let listener = TcpListener::bind(address).await?;
-
+    
+    
+    let config_for_clear = config.clone();
+    // 启动一个独立的任务来定期执行文件清理
+    tokio::spawn(async move {
+        loop {
+            let path = &config_for_clear.server.path.as_str();
+            let files_limit = config_for_clear.storage.cache_limit+1;
+            match delete_old_files(path,files_limit).await {
+                Ok(_) => println!("Old files deleted successfully."),
+                Err(e) => eprintln!("Error deleting old files: {}", e),
+            }
+            // 每20秒执行一次
+            time::sleep(Duration::from_secs(40)).await;
+        }
+    });
 
     println!("Broker server is running on 0.0.0.0:8080");
 

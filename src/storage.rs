@@ -14,12 +14,17 @@ use std::os::unix::prelude::BorrowedFd;
 use crate::config::{Storage,parse_size};
 
 
-const INDEX_ENTRY_SIZE: usize = 16;
+const INDEX_ENTRY_SIZE: usize = 12;
 const INITIAL_INDEX_SIZE: usize = 1024 * INDEX_ENTRY_SIZE; // Initial index file size
 const INDEX_EXPANSION_SIZE: usize = 512 * INDEX_ENTRY_SIZE; // Index expansion size
 
 
 type Offset = AtomicU64;
+#[derive(Clone)]
+struct IndexEntry {
+    start:u64,
+    size:u32,
+}
 
 struct FileEntry {
     base_offset: u64, //历史索引文件的基础偏移
@@ -102,10 +107,15 @@ impl DataStorage {
         }
     }
 
-    async fn read_index(&self, postion: usize) -> io::Result<u64> {
+    async fn read_index(&self, postion: usize) -> io::Result<IndexEntry> {
         if let Some(index_map_lock) = &self.index_map {
             let index_map = index_map_lock.read().await;
-            Ok((&index_map[postion..postion + 8usize]).read_u64::<BigEndian>()?)
+            let start = (&index_map[postion..postion + 8usize]).read_u64::<BigEndian>()?;
+            let size = (&index_map[postion+8usize..postion + 12usize]).read_u32::<BigEndian>()?;
+            Ok(IndexEntry{
+                start,
+                size
+            })
         } else {
             Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -113,6 +123,7 @@ impl DataStorage {
             ))
         }
     }
+
     // 从目录中恢复 DataStorage 的相关字段 
     async fn initialize_files(&mut self) -> io::Result<()> {
         let mut offsets = vec![];
@@ -153,10 +164,12 @@ impl DataStorage {
                         }
                         let data_file = self.open_data_file(*file_name,true).await?;
                         let (_, map) = self.open_index_file(*file_name).await?;
+                        
                         files.push(FileEntry {
                             base_offset: *file_name,
                             data_file: data_file,
                             data: map,
+                            
                         });
                     }
                 }
@@ -167,11 +180,9 @@ impl DataStorage {
                 self.index_len.swap(index_len, Ordering::SeqCst);
                 // 从索引文件读取当前偏移位置 position_offset
                 for index in (0..index_len).step_by(INDEX_ENTRY_SIZE) {
-                    let start = self.read_index(index as usize).await?;
-                    let end = self
-                        .read_index(index as usize + INDEX_ENTRY_SIZE / 2)
-                        .await?;
-                    if start == 0 && end == 0 {
+                    let index_entry = self.read_index(index as usize).await?;
+                    
+                    if index_entry.start == 0 && index_entry.size == 0 {
                         if index > 0 {
                             self.position_offset.swap(
                                 index / (INDEX_ENTRY_SIZE as u64) + last_offset,
@@ -304,7 +315,7 @@ impl DataStorage {
             // 写入记录头和数据
             data_file.write_all(&header)?;
             data_file.write_all(data)?;
-            let end = start + header.len() as u64 + data.len() as u64;
+            let end = header.len() as u32 + data.len() as u32;
             self.data_len
                 .fetch_add(header.len() as u64 + data.len() as u64, Ordering::SeqCst);
             if let Some(index_map_lock) = &self.index_map {
@@ -313,13 +324,13 @@ impl DataStorage {
                 let entry_start = (position - base_offset) as usize * INDEX_ENTRY_SIZE;
                 (&mut index_map[entry_start..entry_start + 8usize])
                     .copy_from_slice(&start.to_be_bytes());
-                (&mut index_map[entry_start + 8usize..entry_start + 16usize])
+                (&mut index_map[entry_start + 8usize..entry_start + 12usize])
                     .copy_from_slice(&end.to_be_bytes());
                 // 在最新索引项后面加入0，以便重启的时候设置position_offset
-                (&mut index_map[entry_start + 16usize..entry_start + 24usize])
+                (&mut index_map[entry_start + 12usize..entry_start + 20usize])
                     .copy_from_slice(&0u64.to_be_bytes());
-                (&mut index_map[entry_start + 24usize..entry_start + 32usize])
-                    .copy_from_slice(&0u64.to_be_bytes());
+                (&mut index_map[entry_start + 20usize..entry_start + 24usize])
+                    .copy_from_slice(&0u32.to_be_bytes());
                 self.position_offset.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             } else {
@@ -352,21 +363,21 @@ impl DataStorage {
         // 在当前文件中
         if offset >= base_offset && position > offset {
             let index_position = (offset - base_offset) as usize * INDEX_ENTRY_SIZE;
-            let start = self.read_index(index_position).await?;
-            let end = self.read_index(index_position + INDEX_ENTRY_SIZE).await?;
+            let index_entry = self.read_index(index_position).await?;
+           
             let len = self.data_len.load(Ordering::SeqCst);
             // 不大于阈值的情况下，尽量多的返回记录
-            let size = if len - start > self.pull_max_limit as u64 {
-                (end - start) as usize
+            let size = if len - index_entry.start > self.pull_max_limit as u64 {
+                index_entry.size as usize
             } else {
-                (len - start) as usize
+                (len - index_entry.start) as usize
             };
 
             if let Some(data_file_locked) = &self.data_file {
                 let data_file = data_file_locked.read().await;
                 let in_fd = data_file.as_fd();
                 // 发送当前文件的数据
-                let _size = call_sendfile(sock_fd,in_fd, start, size);
+                let _size = call_sendfile(sock_fd,in_fd, index_entry.start, size);
                 Ok(size - _size)
             } else {
                 return Err(io::Error::new(
@@ -400,8 +411,8 @@ impl DataStorage {
                 let index_position = (offset - entry.base_offset) as usize * INDEX_ENTRY_SIZE;
                 let start =
                     (&entry.data[index_position..index_position + 8]).read_u64::<BigEndian>()?;
-                let end = (&entry.data[index_position + 8..index_position + 16])
-                    .read_u64::<BigEndian>()?;
+                let end = start + (&entry.data[index_position + 8..index_position + 12])
+                    .read_u32::<BigEndian>()? as u64;
                 let len = entry.data_file.metadata()?.len();
                 let size = if len - start > self.pull_max_limit as u64 {
                     (end - start) as usize
