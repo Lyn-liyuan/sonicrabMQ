@@ -16,5 +16,12 @@ Index Files (*.index) store fixed-size entries for quick data positioning.
 * 🔍 Efficient Data Lookup: Quickly locate and read messages using stored offsets.
 * 🔧 Clean & Modular Design: Easy to extend and integrate into other systems.
 
+## Evaluation
+
+We provide two python scripts for compression testing.
+
+* producer.py will launch 10 processes, which will push 100K messages with payloads ranging from 5KB to 1MB of random data to 5 brokers. It will assign 2 processes to each broker.
+* consomer.py will launch 5 processes, those will pull messages from 5 broker, one process for one broker.
+
 ## License
 This project is licensed under the MIT License. 

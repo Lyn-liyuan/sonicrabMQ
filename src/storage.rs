@@ -141,8 +141,8 @@ impl DataStorage {
             if let Some(&last_offset) = offsets.last() {
                 // 设置当前基础偏移为最新文件的基础偏移
                 self.base_offset.store(last_offset, Ordering::SeqCst);
-                for file_name in offsets {
-                    if file_name == last_offset {
+                for file_name in offsets.iter().rev() {
+                    if *file_name == last_offset {
                         // 当前文件后续进行操作
                         continue;
                     } else {
@@ -151,10 +151,10 @@ impl DataStorage {
                         if files.len() + 1 > self.cache_limit {
                             break;
                         }
-                        let data_file = self.open_data_file(file_name,true).await?;
-                        let (_, map) = self.open_index_file(file_name).await?;
+                        let data_file = self.open_data_file(*file_name,true).await?;
+                        let (_, map) = self.open_index_file(*file_name).await?;
                         files.push(FileEntry {
-                            base_offset: file_name,
+                            base_offset: *file_name,
                             data_file: data_file,
                             data: map,
                         });
@@ -337,13 +337,18 @@ impl DataStorage {
     }
     
     // 在当前或者历史文件定位数据并通过sendfile发送
-    pub async fn sendfile<S>(&self, offset: u64, sock_fd: S) -> io::Result<usize>
+    pub async fn sendfile<S>(&self, since_offset: u64, sock_fd: S) -> io::Result<usize>
     where
         S: AsFd + Clone,
     {
         // Find the correct index file by range
         let base_offset = self.base_offset.load(Ordering::SeqCst);
         let position = self.position_offset.load(Ordering::SeqCst);
+        let offset = if since_offset == 0 && position>0 {
+            position-1
+        } else {
+            since_offset
+        };
         // 在当前文件中
         if offset >= base_offset && position > offset {
             let index_position = (offset - base_offset) as usize * INDEX_ENTRY_SIZE;
@@ -378,7 +383,7 @@ impl DataStorage {
                 let mut pre = 0;
                 for i in 0..len {
                     let base = guard[i].base_offset;
-                    if offset < base {
+                    if offset < base && offset > guard[pre].base_offset {
                         selected_file = Some(&guard[pre]);
                         break;
                     }

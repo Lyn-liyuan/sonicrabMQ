@@ -45,7 +45,10 @@ impl Broker {
 
     // 根据客户端提供的最后一条消息ID来获取文件偏移量，并用 sendfile 发送消息给客户端
     async fn send_messages_since(&mut self, last_id: usize, stream: &mut TcpStream) -> io::Result<()>{
-        self.store.sendfile(last_id as u64, stream.as_fd()).await?;
+        match self.store.sendfile(last_id as u64, stream.as_fd()).await {
+            Ok(size) => println!("send data {} bytes",size),
+            Err(e) => println!("Error: {}", e)
+        }
         let end = (0u32).to_be_bytes();
         stream.write_all(&end).await?;
         Ok(())
