@@ -17,6 +17,9 @@ use crate::config::Config;
 mod fileclear;
 use fileclear::delete_old_files;
 
+const PUSH_COMMAND:&str = "PUSH";
+const PULL_COMMAND:&str = "PULL";
+
 struct Broker {
     store:DataStorage
 }
@@ -96,7 +99,7 @@ async fn handle_client(
         std::io::Read::read_exact(&mut cursor, &mut command_buf).unwrap();
         let command = String::from_utf8(command_buf).unwrap();
 
-        if command == "PUSH" {
+        if command == PUSH_COMMAND {
             let broker_len = ReadBytesExt::read_u16::<BigEndian>(&mut cursor).unwrap() as usize;
             let mut broker_buf = vec![0; broker_len];
             Read::read_exact(&mut cursor, &mut broker_buf).unwrap();
@@ -117,7 +120,7 @@ async fn handle_client(
                 Write::write_all(&mut response, content).unwrap();
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &response).await;
             }
-        } else if command == "PULL" {
+        } else if command == PULL_COMMAND {
             let broker_len = ReadBytesExt::read_u16::<BigEndian>(&mut cursor).unwrap() as usize;
             let mut broker_buf = vec![0; broker_len];
             Read::read_exact(&mut cursor, &mut broker_buf).unwrap();
